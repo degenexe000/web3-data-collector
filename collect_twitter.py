@@ -1,90 +1,145 @@
-
-import tweepy # Twitter API wrapper
-import os     # To access environment variables (Replit Secrets)
-import json   # To print output nicely
-import time   # For potential delays
-from datetime import datetime # To add timestamps
+import tweepy
+import os
+import json
+import time
+from datetime import datetime
+from pymongo import MongoClient # Import MongoDB Driver
+from pymongo.errors import ConnectionFailure # Import specific error type
+import sys
 
 print("--- Starting Twitter Collection Script ---")
 
-# Step 1: Load credentials from Replit Secrets
-# Primarily need Bearer Token for read-only v2 search
-print("Reading Twitter credentials (Bearer Token) from Replit Secrets...")
-bearer_token = os.environ.get('TWITTER_BEARER_TOKEN')
-# api_key = os.environ.get('TWITTER_API_KEY') # Needed for v1.1 or different auth
-# api_secret_key = os.environ.get('TWITTER_API_SECRET_KEY') # Needed for v1.1
-# access_token = os.environ.get('TWITTER_ACCESS_TOKEN') # Needed for v1.1 / user context
-# access_token_secret = os.environ.get('TWITTER_ACCESS_TOKEN_SECRET') # Needed for v1.1 / user context
-
-if not bearer_token:
-    print(">>> Error: TWITTER_BEARER_TOKEN secret not found.")
-    print(">>> Please add the Bearer Token from Twitter Developer Portal to Replit Secrets.")
-    exit()
-else:
-     print("Bearer Token loaded successfully.")
-
-# Step 2: Authenticate with Twitter API v2 Client
-print("\nInitializing Tweepy v2 Client...")
+# --- Database Connection Setup ---
+mongo_client = None
+db = None
+posts_collection = None
 try:
-    # Using v2 Client with Bearer Token (App-only context, standard for search)
-    # wait_on_rate_limit=True automatically pauses if Twitter asks us to slow down
+    print("Reading MONGO_URI from Replit Secrets...")
+    mongo_uri = os.environ.get('MONGO_URI')
+    if not mongo_uri:
+        print(">>> Error: MONGO_URI secret not found or is empty!")
+        print(">>> Please add the connection string from MongoDB Atlas to Replit Secrets.")
+        sys.exit(1)
+
+    print("Connecting to MongoDB Atlas...")
+    # Set serverSelectionTimeoutMS to handle connection issues better
+    mongo_client = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
+    # The ismaster command is cheap and does not require auth.
+    mongo_client.admin.command('ismaster') # Force connection check
+    # Choose/create your database (e.g., 'web3_data')
+    db = mongo_client['web3_data']
+    # Choose/create your collection (e.g., 'social_media_posts')
+    posts_collection = db['social_media_posts']
+    print("MongoDB connection successful!")
+    # Optional: Create an index on tweet_id for faster duplicate checks if needed
+    # posts_collection.create_index("source_specific_id", unique=True) # If making ID unique
+    posts_collection.create_index("source_specific_id") # Index for faster searching
+    posts_collection.create_index("source")
+    print("Index on 'source_specific_id' ensured.")
+
+except ConnectionFailure as conn_err:
+     print(f">>> MongoDB Atlas Connection Failure: {conn_err}")
+     print(">>> Check your MONGO_URI string, network access rules in Atlas, and if the cluster is active.")
+     if mongo_client: mongo_client.close()
+     sys.exit(1)
+except Exception as db_err:
+    print(f">>> MongoDB connection/setup error: {db_err}")
+    if mongo_client: mongo_client.close()
+    sys.exit(1)
+
+
+# --- Twitter API Setup ---
+bearer_token = None
+client = None
+try:
+    print("\nReading Twitter credentials (Bearer Token) from Replit Secrets...")
+    bearer_token = os.environ.get('TWITTER_BEARER_TOKEN')
+    if not bearer_token:
+        print(">>> Error: TWITTER_BEARER_TOKEN secret not found.")
+        sys.exit(1)
+    print("Bearer Token loaded successfully.")
+
+    print("\nInitializing Tweepy v2 Client...")
     client = tweepy.Client(bearer_token=bearer_token, wait_on_rate_limit=True)
     print("Tweepy v2 Client initialized successfully.")
-    # Test authentication with a simple call (optional)
-    # me = client.get_me() # This requires OAuth 2.0 PKCE or OAuth 1.0a User Context - Bearer token might not work
-    # print(f"Testing authentication... (may fail with Bearer Token)") # Typically bearer doesn't allow get_me
-except Exception as e:
-    print(f">>> Error initializing Tweepy Client: {e}")
-    print(">>> Check Bearer Token or other credentials if using different auth.")
-    exit()
+except Exception as api_err:
+    print(f">>> Twitter API setup error: {api_err}")
+    if mongo_client: mongo_client.close() # Close DB connection on early exit
+    sys.exit(1)
 
-# --- Step 3: Configuration ---
-# List of queries using Twitter Search Operators:
-# Ref: https://developer.twitter.com/en/docs/twitter-api/tweets/search/integrate/build-a-query
-# Exclude retweets, optional: filter by language (lang:en)
+
+# --- Search Configuration ---
 search_queries = [
     '(#Web3Jobs OR #CryptoHiring OR #BlockchainCareers) -is:retweet lang:en',
     '("web3 developer salary" OR "blockchain developer pay") -is:retweet lang:en',
-    '(from:Coinbase OR from:binance OR from:ethereum) (hiring OR jobs OR career)', # Example company hiring keywords
+    '(from:Coinbase OR from:binance OR from:ethereum) (hiring OR jobs OR career)',
     '#DeFiJobs -is:retweet lang:en'
 ]
-# How many tweets to fetch per query (max 10 for recent search basic access)
 collection_limit_per_query = 10
 
-collected_tweets = [] # List to store results
 
-# --- Step 4: Execute Search Queries ---
+# --- Execute Searches and Insert into DB ---
 print("\nExecuting search queries for recent tweets (last 7 days)...")
+inserted_count = 0
+skipped_count = 0
+total_processed = 0
+
 try:
     for query in search_queries:
         print(f" Searching for: {query}")
-        tweet_count = 0
         try:
-            # Using search_recent_tweets (Standard v2 API)
             response = client.search_recent_tweets(
                 query,
                 max_results=collection_limit_per_query,
-                # Specify fields you want besides default id/text
                 tweet_fields=["created_at", "public_metrics", "author_id", "lang", "geo"]
             )
 
-            # Process the response
             if response.data:
+                print(f"  > Received {len(response.data)} tweets.")
+                documents_to_insert = [] # Batch insert for efficiency
                 for tweet in response.data:
-                    collected_tweets.append({
-                        'data_type': 'tweet',
+                    total_processed += 1
+                    # Create document structure for MongoDB
+                    tweet_doc = {
+                        'source': 'twitter',
                         'source_query': query,
-                        'tweet_id': str(tweet.id), # Store ID as string often easier
+                        'source_method': 'search_recent',
+                        'source_specific_id': str(tweet.id), # Use a consistent ID field name
                         'text': tweet.text,
                         'author_id': str(tweet.author_id) if tweet.author_id else None,
                         'language': tweet.lang,
-                        'created_at_iso': tweet.created_at.isoformat() if tweet.created_at else None,
-                        'public_metrics': tweet.public_metrics, # dict: impressions, likes, replies, retweets, etc.
-                        'geo': tweet.geo, # Can contain place_id if location tagged
-                        'collected_at_iso': datetime.utcnow().isoformat()
+                        'created_at': tweet.created_at, # Store as ISODate
+                        'public_metrics': tweet.public_metrics,
+                        'geo': tweet.geo,
+                        'collected_at': datetime.utcnow() # Store as ISODate
+                        # Consider adding original full JSON object if needed: 'raw_response': tweet.data
+                    }
+                    # Basic check for duplicates before adding to batch
+                    # Only add if no doc with this source_specific_id and source='twitter' exists
+                    # More efficient might be insert_many with ordered=False or using ON CONFLICT later
+                    existing_doc = posts_collection.find_one({
+                         "source": "twitter",
+                         "source_specific_id": tweet_doc['source_specific_id']
                     })
-                    tweet_count += 1
-                print(f"  Collected {tweet_count} tweets for this query.")
+                    if not existing_doc:
+                        documents_to_insert.append(tweet_doc)
+                    else:
+                         skipped_count += 1
+
+                # Insert the batch of new documents
+                if documents_to_insert:
+                    try:
+                         insert_result = posts_collection.insert_many(documents_to_insert, ordered=False) # ordered=False continues on error
+                         inserted_count += len(insert_result.inserted_ids)
+                         print(f"  Inserted {len(insert_result.inserted_ids)} new tweets into MongoDB.")
+                    except Exception as bulk_err:
+                         print(f"  > Error during bulk insert: {bulk_err}")
+                         # Handle potential individual errors if needed, though ordered=False helps
+                else:
+                    if len(response.data) > skipped_count: # Check if we skipped docs or simply had none to insert
+                        print(f"  No new unique tweets to insert from this batch (Skipped {skipped_count} duplicates).")
+
+
             elif response.errors:
                  print(f"  > API returned errors for this query: {response.errors}")
             else:
@@ -92,34 +147,31 @@ try:
 
         except tweepy.errors.TweepyException as e:
             print(f"  > Tweepy Error processing query '{query}': {e}")
-            # Check for common errors
-            if isinstance(e, tweepy.errors.TwitterServerError):
-                 print("  >> Possible Twitter internal server error.")
-            elif isinstance(e, tweepy.errors.Forbidden):
-                 print("  >> Access forbidden. Check permissions for your API keys/Bearer token.")
-            elif isinstance(e, tweepy.errors.TooManyRequests):
-                 print("  >> Rate limit exceeded. The script should pause automatically due to wait_on_rate_limit=True.")
+            if isinstance(e, tweepy.errors.TooManyRequests):
+                 print("  >> Rate limit hit, Tweepy is pausing automatically...")
+            # Other Tweepy error handling here if needed
         except Exception as e_inner:
             print(f"  > Unexpected error during query '{query}': {e_inner}")
 
-        # Optional polite pause between queries even if wait_on_rate_limit handles major pauses
-        time.sleep(1)
+        time.sleep(1) # Small polite pause between distinct queries
 
 except Exception as e_outer:
     print(f"\n>>> Major error occurred during Twitter search loop: {e_outer}")
+    import traceback
+    traceback.print_exc()
 
-# --- Step 5: Print Results ---
-print(f"\n--- Collected total {len(collected_tweets)} Tweets ---")
+# --- Cleanup ---
+finally:
+    print("\n--- Final Summary ---")
+    print(f"Total Tweets Processed: {total_processed}")
+    print(f"New Tweets Inserted: {inserted_count}")
+    print(f"Tweets Skipped (Duplicate/Error): {skipped_count}")
 
-# Print summary of first few items for verification
-print("\n--- Example Collected Tweets (First 3) ---")
-for i, item in enumerate(collected_tweets[:3]):
-    print(f"\n--- Tweet {i+1} ---")
-    print(f"  Tweet ID: {item.get('tweet_id')}")
-    print(f"  Created At: {item.get('created_at_iso')}")
-    print(f"  Author ID: {item.get('author_id')}")
-    print(f"  Language: {item.get('language')}")
-    print(f"  Text: {item.get('text')}")
-    print(f"  Metrics: {item.get('public_metrics')}")
+    print("Closing MongoDB connection...")
+    if mongo_client:
+        mongo_client.close()
+        print("MongoDB connection closed.")
+    else:
+         print("No MongoDB connection was active.")
 
-print("\n--- Twitter Collection Script Finished ---")
+    print("\n--- Twitter Collection Script Finished ---")
